@@ -1,66 +1,163 @@
-name: Build IPA with Fake Signing
+name: Build and Fake-Sign IPA
 
 on:
-    push:
-        branches: [main] # Or your default branch
-    workflow_dispatch: # Allows manual triggering
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-    build:
-        runs-on: macos-latest # Use the latest macOS runner
+  build:
+    runs-on: macos-15  # 使用最新的 macOS 运行环境
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@v4
+      - name: Install ldid
+        run: brew install ldid
 
-            - name: Install ldid
-              run: brew install ldid
+      - name: Select Xcode version
+        # 尝试切换到 Xcode 16.2，如果环境不可用则跳过
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app || true
 
-            - name: Select Xcode version
-              run: sudo xcode-select -s /Applications/Xcode_16.2.app
+      - name: Build Xcode Archive
+        run: |
+          set -e
+          ARCHIVE_PATH="build/StosVPN.xcarchive"
+          mkdir -p build
+          
+          # 执行构建：禁用标准代码签名，允许模块编译
+          xcodebuild archive \
+            -project StosVPN.xcodeproj \
+            -scheme StosVPN \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CLANG_ENABLE_MODULES=YES \
+            | tee xcodebuild.log
+          
+          echo "Archive created at $ARCHIVE_PATH"
 
-            - name: Build Xcode Archive
-              run: |
-                  xcodebuild archive \
-                    -project StosVPN.xcodeproj \
-                    -scheme StosVPN \
-                    -destination 'generic/platform=iOS' \
-                    -archivePath build/StosVPN.xcarchive \
-                    CODE_SIGN_IDENTITY="" \
-                    CODE_SIGNING_REQUIRED=NO \
-                    CODE_SIGNING_ALLOWED=NO
+      - name: Locate .app inside archive
+        id: locate_app
+        run: |
+          set -e
+          ARCHIVE_PATH="build/StosVPN.xcarchive"
+          APPS_DIR="$ARCHIVE_PATH/Products/Applications"
+          
+          if [ ! -d "$APPS_DIR" ]; then
+            echo "错误: 归档文件中未找到 Products/Applications 目录"
+            ls -R "$ARCHIVE_PATH"
+            exit 1
+          fi
+          
+          APP_PATH=$(find "$APPS_DIR" -maxdepth 1 -name "*.app" | head -n1 || true)
+          if [ -z "$APP_PATH" ]; then
+            echo "错误: 在 $APPS_DIR 中未找到 .app 文件"
+            ls -la "$APPS_DIR"
+            exit 1
+          fi
+          
+          echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
 
-            - name: Create Payload directory
-              run: mkdir -p Payload
+      - name: Create Payload directory and copy .app
+        run: |
+          set -e
+          APP_PATH="${{ steps.locate_app.outputs.app_path }}"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          echo "已将 $APP_PATH 复制到 Payload/ 目录"
 
-            - name: Copy App to Payload
-              run: cp -R build/StosVPN.xcarchive/Products/Applications/StosVPN.app Payload/StosVPN.app
+      - name: Find and Sign App Extension(s)
+        run: |
+          set -e
+          # 查找 Payload 目录下的所有 .appex 扩展
+          APPEXS=$(find Payload -type d -path "*/PlugIns/*.appex" || true)
+          
+          if [ -z "$APPEXS" ]; then
+            echo "未发现 .appex 扩展，跳过扩展签名。"
+          else
+            echo "发现以下扩展："
+            echo "$APPEXS"
+            
+            while IFS= read -r ap; do
+              if [ -z "$ap" ]; then continue; fi
+              echo "正在处理扩展: $ap"
+              
+              # 查找扩展内的二进制文件
+              EXE=$(find "$ap" -maxdepth 1 -type f -perm +111 -print -o -name "$(basename "$ap" .appex)" -print | head -n1 || true)
+              
+              if [ -z "$EXE" ]; then
+                # 备用方案：查找体积最大的文件作为二进制
+                EXE=$(find "$ap" -type f -print0 | xargs -0 ls -S | head -n1 || true)
+              fi
+              
+              if [ -z "$EXE" ]; then
+                echo "警告: 无法在 $ap 中找到二进制文件，跳过。"
+                continue
+              fi
+              
+              echo "扩展二进制路径: $EXE"
+              ENT="${GITHUB_WORKSPACE}/TunnelProv/TunnelProv.entitlements"
+              
+              if [ -f "$ENT" ]; then
+                echo "使用权利文件 $ENT 进行伪签名"
+                ldid -S"$ENT" "$EXE" || { echo "ldid 签名失败: $EXE"; exit 1; }
+              else
+                echo "未找到权利文件 $ENT，进行基础签名"
+                ldid "$EXE" || { echo "ldid 签名失败: $EXE"; exit 1; }
+              fi
+              echo "成功签名: $EXE"
+            done <<< "$APPEXS"
+          fi
 
-            - name: Find and Sign App Extension
-              run: |
-                  APPEX_PATH=$(find Payload/StosVPN.app/PlugIns -name "*.appex" | head -n 1)
-                  if [ -z "$APPEX_PATH" ]; then
-                    echo "Error: App Extension (.appex) not found in PlugIns directory."
-                    exit 1
-                  fi
-                  echo "Found App Extension at: $APPEX_PATH"
-                  # Use the specific entitlements for the extension
-                  ldid -S"${GITHUB_WORKSPACE}/TunnelProv/TunnelProv.entitlements" "$APPEX_PATH/$(basename "$APPEX_PATH" .appex)"
-                  echo "Signed App Extension."
+      - name: Sign Main App Binary
+        run: |
+          set -e
+          APP_DIR=$(find Payload -maxdepth 1 -name "*.app" | head -n1)
+          if [ -z "$APP_DIR" ]; then
+            echo "错误: Payload 目录中未找到 .app"
+            exit 1
+          fi
+          
+          # 从 Info.plist 获取主程序执行文件名
+          EXEC_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_DIR/Info.plist" 2>/dev/null || true)
+          
+          if [ -n "$EXEC_NAME" ]; then
+            APP_BIN="$APP_DIR/$EXEC_NAME"
+          else
+            # 备用：查找最大执行文件
+            APP_BIN=$(find "$APP_DIR" -type f -perm +111 -print0 | xargs -0 ls -S | head -n1 || true)
+          fi
+          
+          if [ -z "$APP_BIN" ] || [ ! -f "$APP_BIN" ]; then
+            echo "错误: 无法定位主程序二进制文件"
+            ls -la "$APP_DIR"
+            exit 1
+          fi
+          
+          echo "主程序二进制: $APP_BIN"
+          ENT_FILE="${GITHUB_WORKSPACE}/StosVPN/StosVPN.entitlements"
+          
+          if [ -f "$ENT_FILE" ]; then
+            ldid -S"$ENT_FILE" "$APP_BIN" || { echo "主程序 ldid 签名失败"; exit 1; }
+          else
+            echo "未找到权利文件 $ENT_FILE，进行基础签名"
+            ldid "$APP_BIN" || { echo "主程序 ldid 签名失败"; exit 1; }
+          fi
+          echo "主程序签名完成。"
 
-            - name: Sign Main App Bundle
-              run: |
-                  APP_BINARY_PATH="Payload/StosVPN.app/StosVPN"
-                  # Use the specific entitlements for the main app
-                  ldid -S"${GITHUB_WORKSPACE}/StosVPN/StosVPN.entitlements" "$APP_BINARY_PATH"
-                  echo "Signed Main App Bundle."
+      - name: Create IPA
+        run: |
+          set -e
+          zip -r StosVPN-fakesigned.ipa Payload
+          echo "IPA 已创建: StosVPN-fakesigned.ipa"
 
-            - name: Create IPA
-              run: |
-                  zip -r ./StosVPN-fakesigned.ipa Payload
-
-            - name: Upload IPA Artifact
-              uses: actions/upload-artifact@v4
-              with:
-                  name: StosVPN-IPA.ipa
-                  path: StosVPN-fakesigned.ipa
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StosVPN-IPA
+          path: StosVPN-fakesigned.ipa
