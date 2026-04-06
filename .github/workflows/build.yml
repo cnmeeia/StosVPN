@@ -3,13 +3,12 @@ name: Build and Fake-Sign IPA
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-15  # 使用最新的 macOS 运行环境
+    # 使用 macos-14 或 macos-15 均可，但不要强行指定尚未配置好 SDK 的 Xcode
+    runs-on: macos-15 
     
     steps:
       - name: Checkout repository
@@ -18,17 +17,20 @@ jobs:
       - name: Install ldid
         run: brew install ldid
 
-      - name: Select Xcode version
-        # 尝试切换到 Xcode 16.2，如果环境不可用则跳过
-        run: sudo xcode-select -s /Applications/Xcode_16.2.app || true
+      # 建议移除手动 xcode-select，让系统使用默认稳定的版本
+      # 或者使用 xcode-select -p 查看当前版本
 
       - name: Build Xcode Archive
         run: |
+          # 关键：确保 pipe 中的任何命令失败都会导致步骤失败
+          set -o pipefail
           set -e
+          
           ARCHIVE_PATH="build/StosVPN.xcarchive"
           mkdir -p build
           
-          # 执行构建：禁用标准代码签名，允许模块编译
+          # 执行构建
+          # 添加了 AD_HOC_CODE_SIGNING_ALLOWED=YES (有时对某些项目有用)
           xcodebuild archive \
             -project StosVPN.xcodeproj \
             -scheme StosVPN \
@@ -36,6 +38,8 @@ jobs:
             -archivePath "$ARCHIVE_PATH" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            ALLOW_PROVISIONING_DEVICE_REGISTRATION=NO \
             CLANG_ENABLE_MODULES=YES \
             | tee xcodebuild.log
           
@@ -49,18 +53,11 @@ jobs:
           APPS_DIR="$ARCHIVE_PATH/Products/Applications"
           
           if [ ! -d "$APPS_DIR" ]; then
-            echo "错误: 归档文件中未找到 Products/Applications 目录"
-            ls -R "$ARCHIVE_PATH"
+            echo "错误: 归档文件未生成。请检查上一步 xcodebuild.log 的具体错误。"
             exit 1
           fi
           
-          APP_PATH=$(find "$APPS_DIR" -maxdepth 1 -name "*.app" | head -n1 || true)
-          if [ -z "$APP_PATH" ]; then
-            echo "错误: 在 $APPS_DIR 中未找到 .app 文件"
-            ls -la "$APPS_DIR"
-            exit 1
-          fi
-          
+          APP_PATH=$(find "$APPS_DIR" -maxdepth 1 -name "*.app" | head -n1)
           echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
 
       - name: Create Payload directory and copy .app
@@ -69,48 +66,21 @@ jobs:
           APP_PATH="${{ steps.locate_app.outputs.app_path }}"
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
-          echo "已将 $APP_PATH 复制到 Payload/ 目录"
 
       - name: Find and Sign App Extension(s)
         run: |
           set -e
-          # 查找 Payload 目录下的所有 .appex 扩展
           APPEXS=$(find Payload -type d -path "*/PlugIns/*.appex" || true)
-          
-          if [ -z "$APPEXS" ]; then
-            echo "未发现 .appex 扩展，跳过扩展签名。"
-          else
-            echo "发现以下扩展："
-            echo "$APPEXS"
-            
+          if [ -n "$APPEXS" ]; then
             while IFS= read -r ap; do
-              if [ -z "$ap" ]; then continue; fi
-              echo "正在处理扩展: $ap"
-              
-              # 查找扩展内的二进制文件
-              EXE=$(find "$ap" -maxdepth 1 -type f -perm +111 -print -o -name "$(basename "$ap" .appex)" -print | head -n1 || true)
-              
-              if [ -z "$EXE" ]; then
-                # 备用方案：查找体积最大的文件作为二进制
-                EXE=$(find "$ap" -type f -print0 | xargs -0 ls -S | head -n1 || true)
-              fi
-              
-              if [ -z "$EXE" ]; then
-                echo "警告: 无法在 $ap 中找到二进制文件，跳过。"
-                continue
-              fi
-              
-              echo "扩展二进制路径: $EXE"
+              [ -z "$ap" ] && continue
+              EXE=$(find "$ap" -maxdepth 1 -type f -perm +111 | head -n1)
               ENT="${GITHUB_WORKSPACE}/TunnelProv/TunnelProv.entitlements"
-              
               if [ -f "$ENT" ]; then
-                echo "使用权利文件 $ENT 进行伪签名"
-                ldid -S"$ENT" "$EXE" || { echo "ldid 签名失败: $EXE"; exit 1; }
+                ldid -S"$ENT" "$EXE"
               else
-                echo "未找到权利文件 $ENT，进行基础签名"
-                ldid "$EXE" || { echo "ldid 签名失败: $EXE"; exit 1; }
+                ldid "$EXE"
               fi
-              echo "成功签名: $EXE"
             done <<< "$APPEXS"
           fi
 
@@ -118,43 +88,19 @@ jobs:
         run: |
           set -e
           APP_DIR=$(find Payload -maxdepth 1 -name "*.app" | head -n1)
-          if [ -z "$APP_DIR" ]; then
-            echo "错误: Payload 目录中未找到 .app"
-            exit 1
-          fi
-          
-          # 从 Info.plist 获取主程序执行文件名
-          EXEC_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_DIR/Info.plist" 2>/dev/null || true)
-          
-          if [ -n "$EXEC_NAME" ]; then
-            APP_BIN="$APP_DIR/$EXEC_NAME"
-          else
-            # 备用：查找最大执行文件
-            APP_BIN=$(find "$APP_DIR" -type f -perm +111 -print0 | xargs -0 ls -S | head -n1 || true)
-          fi
-          
-          if [ -z "$APP_BIN" ] || [ ! -f "$APP_BIN" ]; then
-            echo "错误: 无法定位主程序二进制文件"
-            ls -la "$APP_DIR"
-            exit 1
-          fi
-          
-          echo "主程序二进制: $APP_BIN"
+          EXEC_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_DIR/Info.plist")
+          APP_BIN="$APP_DIR/$EXEC_NAME"
           ENT_FILE="${GITHUB_WORKSPACE}/StosVPN/StosVPN.entitlements"
           
           if [ -f "$ENT_FILE" ]; then
-            ldid -S"$ENT_FILE" "$APP_BIN" || { echo "主程序 ldid 签名失败"; exit 1; }
+            ldid -S"$ENT_FILE" "$APP_BIN"
           else
-            echo "未找到权利文件 $ENT_FILE，进行基础签名"
-            ldid "$APP_BIN" || { echo "主程序 ldid 签名失败"; exit 1; }
+            ldid "$APP_BIN"
           fi
-          echo "主程序签名完成。"
 
       - name: Create IPA
         run: |
-          set -e
           zip -r StosVPN-fakesigned.ipa Payload
-          echo "IPA 已创建: StosVPN-fakesigned.ipa"
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
